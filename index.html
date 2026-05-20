@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>May WOW @NSQ — SAP Cohort Portal</title>
+<title>May WOW @NSQ — SAP Cohort Portal (v21)</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap');
 
@@ -2393,12 +2393,14 @@ function _lsSet(key, val) { try { localStorage.setItem(key, JSON.stringify(val))
 // Return only the text fields of a person (NO photo).
 // This keeps localStorage entries tiny (~400 bytes each).
 function _slimPerson(p) {
-  return {
+  var s = {
     fullName: p.fullName, email: p.email, type: p.type,
     boardArea: p.boardArea, functionalArea: p.functionalArea,
     team: p.team, orgUnit: p.orgUnit, officeLocation: p.officeLocation,
     manager: p.manager, linkedinUrl: p.linkedinUrl
   };
+  if (p.photo) s.photo = p.photo;   // preserve profile photo in edits
+  return s;
 }
 
 // Apply all persisted changes to the live PEOPLE array.
@@ -2572,19 +2574,39 @@ function openAdminPanel() {
   var spDetail = document.getElementById('sp-admin-detail');
   if (spInfo && spDetail) {
     if (_SP_MODE) {
+      var _tok = _lsGet('_gh_pat');
       spInfo.style.display = 'block';
-      spInfo.style.background = '#D4EDDA';
-      spInfo.style.borderColor = '#C3E6CB';
-      spDetail.innerHTML =
-        '<b style="color:#155724">Connected</b> &mdash; changes sync to all users in real time.<br>' +
-        '<span style="font-size:11px;word-break:break-all;opacity:.8;">' + _SP_ORIGIN + _SP_FOLDER + '/cohort_data.json</span>';
+      if (_tok) {
+        spInfo.style.background = '#D4EDDA';
+        spInfo.style.borderColor = '#C3E6CB';
+        spDetail.innerHTML =
+          '<b style="color:#155724">GitHub Sync Active</b> &mdash; changes save to ' +
+          '<code style="font-size:11px;">' + _GH_OWNER + '/' + _GH_REPO + '/cohort_data.json</code>' +
+          ' and are visible to all users within ~60 s.<br>' +
+          '<span style="font-size:11px;opacity:.8;display:block;margin-top:3px;">Token: ' +
+          _tok.substring(0,7) + '... (stored in this browser)</span>';
+      } else {
+        spInfo.style.background = '#FFF3CD';
+        spInfo.style.borderColor = '#FFEEBA';
+        spDetail.innerHTML =
+          '<b style="color:#856404">Token Required</b> &mdash; enter your GitHub token below ' +
+          'to enable shared sync for all users.';
+      }
     } else {
       spInfo.style.display = 'block';
-      spInfo.style.background = '#FFF3CD';
-      spInfo.style.borderColor = '#FFEEBA';
+      spInfo.style.background = '#E9ECEF';
+      spInfo.style.borderColor = '#CED4DA';
       spDetail.innerHTML =
-        '<b style="color:#856404">Local mode</b> &mdash; changes are saved in this browser only.<br>' +
-        '<span style="font-size:11px;opacity:.8;">To enable shared sync, upload this file to SharePoint and open via its SharePoint URL.</span>';
+        '<b style="color:#495057">Local mode</b> &mdash; changes are saved in this browser only.';
+    }
+    // Populate PAT input hint if token exists
+    var _patInput = document.getElementById('gh-pat-input');
+    if (_patInput) {
+      var _existingTok = _lsGet('_gh_pat');
+      _patInput.placeholder = _existingTok
+        ? 'Token saved (' + _existingTok.substring(0,7) + '...) — enter new to replace'
+        : 'ghp_xxxxxxxxxxxxxxxxxxxx';
+      _patInput.value = '';
     }
   }
   document.getElementById('admin-panel-overlay').classList.add('open');
@@ -2609,15 +2631,19 @@ var _SP_MODE   = false;
 var _SP_ORIGIN = '';
 var _SP_FOLDER = '';
 var _spSaveTimer  = null;
+// ── GitHub Pages sync ─────────────────────────────────────────────────────────
+var _GH_OWNER = '';
+var _GH_REPO  = '';
 
 // ── Detect SharePoint hosting ─────────────────────────────────────────────
 function _spInit() {
+  // Detect GitHub Pages (*.github.io) — owner = first subdomain, repo = first path segment
   var h = location.hostname;
-  if (h.indexOf('.sharepoint.com') !== -1) {
-    _SP_MODE   = true;
-    _SP_ORIGIN = location.origin;
-    var path   = decodeURIComponent(location.pathname);
-    _SP_FOLDER = path.substring(0, path.lastIndexOf('/'));
+  if (h.endsWith('.github.io')) {
+    _SP_MODE  = true;
+    _GH_OWNER = h.split('.')[0];
+    var parts = location.pathname.split('/').filter(Boolean);
+    _GH_REPO  = parts[0] || '';
     return true;
   }
   return false;
@@ -2625,25 +2651,33 @@ function _spInit() {
 
 // ── Get SharePoint request digest (required for write operations) ─────────
 async function _spGetDigest() {
+  // Returns the current file SHA (required for GitHub API updates)
+  // Returns '__new__' if the file does not yet exist.
   try {
-    var r = await fetch(_SP_ORIGIN + '/_api/contextinfo', {
-      method: 'POST',
-      headers: { 'Accept': 'application/json;odata=verbose' }
+    var token = _lsGet('_gh_pat');
+    if (!token) return null;
+    var apiUrl  = 'https://api.github.com/repos/' + _GH_OWNER + '/' + _GH_REPO
+                + '/contents/cohort_data.json';
+    var r = await fetch(apiUrl, {
+      headers: {
+        'Authorization': 'token ' + token,
+        'Accept':        'application/vnd.github.v3+json'
+      }
     });
+    if (r.status === 404) return '__new__';   // file does not exist yet — first save
+    if (!r.ok) return null;
     var j = await r.json();
-    return j.d.GetContextWebInformation.FormDigestValue;
+    return j.sha || null;
   } catch(e) { return null; }
 }
 
 // ── Read cohort_data.json from SharePoint ─────────────────────────────────
 async function _spLoad() {
   try {
-    var fileUrl = _SP_FOLDER + '/cohort_data.json';
-    var apiUrl  = _SP_ORIGIN + "/_api/web/GetFileByServerRelativeUrl('" +
-                  fileUrl.replace(/'/g, "''") + "')/$value";
-    var r = await fetch(apiUrl, {
-      headers: { 'Accept': 'application/json' }
-    });
+    // Public raw URL — no token required (works for any visitor)
+    var rawUrl = 'https://raw.githubusercontent.com/' + _GH_OWNER + '/' + _GH_REPO
+               + '/main/cohort_data.json?_t=' + Date.now();
+    var r = await fetch(rawUrl, { cache: 'no-store' });
     if (!r.ok) return null;
     return await r.json();
   } catch(e) { return null; }
@@ -2652,25 +2686,36 @@ async function _spLoad() {
 // ── Write cohort_data.json to SharePoint ──────────────────────────────────
 async function _spSave(delta) {
   try {
+    var token = _lsGet('_gh_pat');
+    if (!token) { _spUpdateStatus('offline'); return false; }
     _spUpdateStatus('saving');
-    var digest = await _spGetDigest();
-    if (!digest) { _spUpdateStatus('error'); return false; }
-    var uploadUrl = _SP_ORIGIN + "/_api/web/GetFolderByServerRelativeUrl('" +
-                    _SP_FOLDER.replace(/'/g, "''") +
-                    "')/Files/Add(url='cohort_data.json',overwrite=true)";
-    var r = await fetch(uploadUrl, {
-      method: 'POST',
+    var sha    = await _spGetDigest();
+    if (sha === null) { _spUpdateStatus('error'); return false; }
+    var apiUrl  = 'https://api.github.com/repos/' + _GH_OWNER + '/' + _GH_REPO
+                + '/contents/cohort_data.json';
+    // GitHub requires base64 content (UTF-8 safe)
+    var json    = JSON.stringify(delta, null, 2);
+    var content = btoa(unescape(encodeURIComponent(json)));
+    var body    = {
+      message: 'Update cohort data ' + new Date().toISOString(),
+      content: content
+    };
+    if (sha !== '__new__') body.sha = sha;   // required for updates, omit for new file
+    var r = await fetch(apiUrl, {
+      method:  'PUT',
       headers: {
-        'Accept':          'application/json;odata=verbose',
-        'X-RequestDigest': digest,
-        'Content-Type':    'application/octet-stream'
+        'Authorization': 'token ' + token,
+        'Content-Type':  'application/json',
+        'Accept':        'application/vnd.github.v3+json'
       },
-      body: JSON.stringify(delta)
+      body: JSON.stringify(body)
     });
     if (r.ok) { _spUpdateStatus('saved'); return true; }
+    var errJson = await r.json().catch(function(){ return {}; });
+    console.error('GitHub save error:', errJson);
     _spUpdateStatus('error');
     return false;
-  } catch(e) { _spUpdateStatus('error'); return false; }
+  } catch(e) { console.error(e); _spUpdateStatus('error'); return false; }
 }
 
 // ── Debounced save (1.5 s after last change) ──────────────────────────────
@@ -2725,10 +2770,10 @@ function _spUpdateStatus(state) {
   if (!el) return;
   var labels = {
     loading: 'Loading shared data\u2026',
-    saving:  'Saving\u2026',
-    saved:   'All changes saved',
-    error:   'Sync error \u2014 changes saved locally',
-    offline: 'Offline mode (local only)'
+    saving:  'Saving to GitHub\u2026',
+    saved:   'All changes saved to GitHub',
+    error:   'GitHub sync error \u2014 changes saved locally',
+    offline: 'Set GitHub Token in Admin \u2192 enable sync for all users'
   };
   el.textContent = labels[state] || state;
   el.setAttribute('data-state', state);
@@ -2745,19 +2790,22 @@ async function _initApp() {
       _applyDelta(delta);
       _spUpdateStatus('saved');
     } else {
-      // First run on SharePoint — bootstrap from any local changes.
+      // No data file yet — apply any local changes and save if we have a token.
       _applyPersistedState();
-      // Auto-initialise the shared file so subsequent users see the same base.
-      setTimeout(function() {
-        var initDelta = {
-          version:      2,
-          lastModified: new Date().toISOString(),
-          adds:  _lsGet(_LS_ADD)   || [],
-          edits: _lsGet(_LS_EDITS) || {},
-          dels:  _lsGet(_LS_DEL)   || []
-        };
-        _spSave(initDelta);
-      }, 1000);
+      if (_lsGet('_gh_pat')) {
+        setTimeout(function() {
+          var initDelta = {
+            version:      2,
+            lastModified: new Date().toISOString(),
+            adds:  _lsGet(_LS_ADD)   || [],
+            edits: _lsGet(_LS_EDITS) || {},
+            dels:  _lsGet(_LS_DEL)   || []
+          };
+          _spSave(initDelta);
+        }, 1000);
+      } else {
+        _spUpdateStatus('offline');
+      }
     }
   } else {
     _spUpdateStatus('offline');
@@ -2768,6 +2816,43 @@ async function _initApp() {
 }
 
 // ── Boot (async: loads from SharePoint or falls back to localStorage) ────────
+
+// ── GitHub PAT management ─────────────────────────────────────────────────────────────────────────────
+function _ghSaveToken() {
+  var input = document.getElementById('gh-pat-input');
+  if (!input) return;
+  var token = (input.value || '').trim();
+  if (!token) {
+    var existing = _lsGet('_gh_pat');
+    if (existing) {
+      if (confirm('Remove the saved GitHub token? Sync will be disabled.')) {
+        localStorage.removeItem('_gh_pat');
+        openAdminPanel();
+      }
+    } else {
+      alert('Please enter a GitHub Personal Access Token.');
+    }
+    return;
+  }
+  _lsSet('_gh_pat', token);
+  input.value = '';
+  openAdminPanel();
+  _spUpdateStatus('loading');
+  _spLoad().then(function(delta) {
+    if (delta) {
+      _applyDelta(delta);
+      renderCards(PEOPLE);
+      _spUpdateStatus('saved');
+    } else {
+      var initDelta = {
+        version: 2, lastModified: new Date().toISOString(),
+        adds: _lsGet(_LS_ADD) || [], edits: _lsGet(_LS_EDITS) || {}, dels: _lsGet(_LS_DEL) || []
+      };
+      _spSave(initDelta);
+    }
+  });
+}
+
 _initApp();
 </script>
 
@@ -3809,9 +3894,31 @@ function _apOverlayClick(e){if(e.target===document.getElementById('add-profile-o
       Export Updated Directory File
     </button>
     <div style="font-size:13px;font-weight:700;color:#1D2329;margin-bottom:8px;">Deleted Profiles</div>
-    <div id="sp-admin-info" style="margin-bottom:16px;padding:12px 14px;border-radius:8px;font-size:13px;background:var(--surface);border:1px solid var(--border);display:none;">
-      <div style="font-weight:600;margin-bottom:4px;">SharePoint Sync</div>
+    <div id="sp-admin-info" style="margin-bottom:12px;padding:12px 14px;border-radius:8px;font-size:13px;background:var(--surface);border:1px solid var(--border);display:none;">
+      <div style="font-weight:600;margin-bottom:4px;">GitHub Sync</div>
       <div id="sp-admin-detail" style="color:var(--muted);font-size:12px;">Not connected</div>
+    </div>
+    <!-- GitHub PAT input -->
+    <div style="margin-bottom:16px;padding:12px 14px;border-radius:8px;border:1px solid var(--border);background:var(--surface);">
+      <div style="font-size:12px;font-weight:700;color:#1D2329;margin-bottom:8px;">GitHub Token (for saving changes)</div>
+      <div style="display:flex;gap:8px;align-items:stretch;">
+        <input id="gh-pat-input" type="password"
+          placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+          style="flex:1;border:1px solid var(--border);border-radius:6px;
+                 padding:8px 10px;font-size:12px;font-family:monospace;
+                 outline:none;min-width:0;" />
+        <button onclick="_ghSaveToken()"
+          style="background:#0070F2;color:#fff;border:none;border-radius:6px;
+                 padding:8px 14px;font-size:12px;font-weight:700;cursor:pointer;
+                 font-family:inherit;white-space:nowrap;">Save</button>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:7px;line-height:1.5;">
+        Required to save edits for all users.
+        <a href="https://github.com/settings/tokens/new?description=WOW-Roster&scopes=repo"
+           target="_blank" style="color:#0070F2;text-decoration:none;">Create token</a>
+        with <b>Contents: Write</b> scope on the repo.
+        Token is stored only in this browser.
+      </div>
     </div>
     <div id="admin-del-list" style="overflow-y:auto;flex:1;min-height:60px;"></div>
   </div>
